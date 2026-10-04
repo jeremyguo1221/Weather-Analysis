@@ -674,6 +674,27 @@ ul.insights li { margin-bottom: 10px; }
     </div>
   </section>
 
+  <section id="tab-blend">
+    <h2>Blended Model (GFS + ECE + GEFS)</h2>
+    <p class="note">For each lead day, the blend finds non-negative weights (summing to 1) for the three models plus a bias correction, chosen to minimize squared error. <b>All numbers here are out-of-sample.</b> Weights are refit at the start of every month using only forecasts whose valid date has already passed, then applied to that month's runs (walk-forward, expanding window, 12-month warm-up). Single models are scored on exactly the same rows, so the comparison is like-for-like. ECE stops at day 14, so lead 15 blends GFS + GEFS only.</p>
+    <div class="panel" id="blend-summary"></div>
+    <div class="panel">
+      <h3 style="margin-top:0">Out-of-Sample Scorecard</h3>
+      <p class="note" style="margin-top:4px">Candidate blending methods vs. each single model, by window. Colors rank rows within each window (green = best).</p>
+      <div id="blend-scorecard"></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">RMSE by Lead Day</h3>
+      <p class="note" style="margin-top:4px">The dip at days 14–15 is a sampling artifact, not real skill: the source files contain far fewer forecasts at those leads (~150 vs ~640), and they fall mostly in summer, when GWDD varies little.</p>
+      <div class="chart-wrap"><canvas id="chart-blend-lead"></canvas></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">Blend Weights by Lead Day</h3>
+      <p class="note" style="margin-top:4px">Current weights, fit on all verified history. These are the weights a live forecast would use today.</p>
+      <div class="chart-wrap"><canvas id="chart-blend-weights"></canvas></div>
+    </div>
+  </section>
+
   <section id="tab-extreme">
     <h2>Extreme Events</h2>
     <p class="note">Granular row-level lookups — three sections: (1) most extreme forecasts (standardized anomaly, z-scored by month), (2) most extreme observed actuals (top &amp; bottom of the history), (3) biggest forecast misses per individual lead day 10–15.</p>
@@ -709,7 +730,7 @@ ul.insights li { margin-bottom: 10px; }
 
 <script>
 const DATA = __DATA_JSON__;
-const COLORS = { GFS: '#58a6ff', ECE: '#f0883e', GEFS: '#3fb950' };
+const COLORS = { GFS: '#58a6ff', ECE: '#f0883e', GEFS: '#3fb950', BLEND: '#d2a8ff' };
 
 Chart.defaults.color = '#e6edf3';
 Chart.defaults.borderColor = '#30363d';
@@ -717,6 +738,7 @@ Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, "Segoe UI", Rob
 
 const TABS = [
   ['tab-scorecard',   'Scorecard'],
+  ['tab-blend',       'Blended Model'],
   ['tab-forecast',    'Forecast vs Actual'],
   ['tab-bias',        'Bias & Seasonality'],
   ['tab-convergence', 'Convergence'],
@@ -1345,6 +1367,111 @@ function renderKdcaEvents() {
   document.getElementById('kdca-events-table').innerHTML = html;
 }
 
+const BLEND_LABELS = {
+  EQUAL: 'Equal average',
+  INV_MSE: 'Inverse-MSE weights',
+  WEIGHTED_BC: 'Optimized weights + bias corr.',
+  WEIGHTED_BC_SEASONAL: 'Optimized weights + seasonal bias corr.',
+};
+let chartBlendLead = null, chartBlendWeights = null;
+
+function renderBlendSummary() {
+  const b = DATA.blend;
+  let html = `<p style="margin-top:0">Test period: runs <b>${b.testStart}</b> to <b>${b.testEnd}</b> `
+           + `(${b.nTest.toLocaleString()} forecasts). Selected method: <b style="color:${COLORS.BLEND}">${BLEND_LABELS[b.best]}</b>.</p>`;
+  html += '<table><thead><tr><th>Window</th><th>Best single model</th><th>Single RMSE</th><th>Blend RMSE</th><th>RMSE improvement</th><th>Blend ±1 Hit %</th></tr></thead><tbody>';
+  ['1-5d','6-10d','11-15d'].forEach(w => {
+    const singles = ['GFS','ECE','GEFS'].map(m => b.windowStats.find(r => r.Model === m && r.Window === w)).filter(Boolean);
+    const best = singles.reduce((a, c) => c.RMSE < a.RMSE ? c : a);
+    const bl = b.windowStats.find(r => r.Model === 'BLEND' && r.Window === w);
+    const imp = (best.RMSE - bl.RMSE) / best.RMSE * 100;
+    html += `<tr><td>${w}</td><td><b style="color:${COLORS[best.Model]}">${best.Model}</b></td><td>${fmt(best.RMSE)}</td>`
+          + `<td><b style="color:${COLORS.BLEND}">${fmt(bl.RMSE)}</b></td><td>${imp >= 0 ? '+' : ''}${imp.toFixed(1)}%</td><td>${fmt(bl.HitRate1, 1)}</td></tr>`;
+  });
+  html += '</tbody></table>';
+  document.getElementById('blend-summary').innerHTML = html;
+}
+
+function renderBlendScorecard() {
+  const rows = DATA.blend.windowStats;
+  const models = ['GFS','ECE','GEFS', ...Object.keys(BLEND_LABELS)];
+  const metrics = [['RMSE','RMSE',true], ['MAE','MAE',true], ['Bias','Bias',true], ['Corr','Correlation',false],
+                   ['HitRate1','±1 Hit %',false], ['MeanAbsRev','Mean |Chg1|',true], ['N','N',null]];
+  let html = '<table><thead><tr><th>Model / Method</th><th>Window</th>';
+  metrics.forEach(([_, label]) => html += `<th>${label}</th>`);
+  html += '</tr></thead><tbody>';
+  ['1-5d','6-10d','11-15d'].forEach(w => {
+    const wr = models.map(m => rows.find(r => r.Model === m && r.Window === w));
+    const scales = {};
+    metrics.forEach(([key, _, lower]) => {
+      if (lower !== null) scales[key] = colorScale(wr.map(r => r ? (key === 'Bias' ? Math.abs(r[key]) : r[key]) : NaN), lower);
+    });
+    models.forEach((m, i) => {
+      const r = wr[i];
+      if (!r) return;
+      const name = COLORS[m] ? `<b style="color:${COLORS[m]}">${m}</b>`
+                 : (m === DATA.blend.best ? `<b style="color:${COLORS.BLEND}">${BLEND_LABELS[m]} ★</b>` : BLEND_LABELS[m]);
+      html += `<tr><td>${name}</td><td>${w}</td>`;
+      metrics.forEach(([key, _, lower]) => {
+        const v = r[key];
+        if (v == null || !isFinite(v)) { html += '<td>—</td>'; return; }
+        const bg = lower === null ? 'transparent' : scales[key][i];
+        const txt = key === 'N' ? v : key === 'HitRate1' ? v.toFixed(1) : v.toFixed(3);
+        html += `<td><span class="cell" style="background:${bg}">${txt}</span></td>`;
+      });
+      html += '</tr>';
+    });
+  });
+  html += '</tbody></table><p class="note">★ = selected as the blend (lowest out-of-sample RMSE across all leads).</p>';
+  document.getElementById('blend-scorecard').innerHTML = html;
+}
+
+function renderBlendLeadChart() {
+  const leads = Array.from({length: 15}, (_, i) => i + 1);
+  const datasets = ['GFS','ECE','GEFS','BLEND'].map(m => ({
+    label: m,
+    data: leads.map(L => {
+      const r = DATA.blend.leadStats.find(x => x.Model === m && x.LeadDays === L);
+      return r ? r.RMSE : null;
+    }),
+    borderColor: COLORS[m], backgroundColor: COLORS[m],
+    borderWidth: m === 'BLEND' ? 3 : 1.6, pointRadius: m === 'BLEND' ? 3.5 : 2, tension: 0.2,
+  }));
+  if (chartBlendLead) chartBlendLead.destroy();
+  chartBlendLead = new Chart(document.getElementById('chart-blend-lead'), {
+    type: 'line',
+    data: { labels: leads, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { title: { display: true, text: 'Lead Day' }, grid: { color: '#1f242b' } },
+        y: { title: { display: true, text: 'RMSE (GWDD, out-of-sample)' }, grid: { color: '#1f242b' } }
+      }
+    }
+  });
+}
+
+function renderBlendWeights() {
+  const w = DATA.blend.weights;
+  const datasets = ['GFS','ECE','GEFS'].map(m => ({
+    label: m, data: w.map(r => r['w_' + m]), backgroundColor: COLORS[m], stack: 'w',
+  }));
+  if (chartBlendWeights) chartBlendWeights.destroy();
+  chartBlendWeights = new Chart(document.getElementById('chart-blend-weights'), {
+    type: 'bar',
+    data: { labels: w.map(r => r.LeadDays), datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${(c.parsed.y * 100).toFixed(0)}%` } } },
+      scales: {
+        x: { stacked: true, title: { display: true, text: 'Lead Day' }, grid: { color: '#1f242b' } },
+        y: { stacked: true, max: 1, title: { display: true, text: 'Weight' },
+             ticks: { callback: v => (v * 100).toFixed(0) + '%' }, grid: { color: '#1f242b' } }
+      }
+    }
+  });
+}
+
 function renderInsights() {
   const html = '<ul class="insights">' +
     DATA.insights.map(line => `<li>${line}</li>`).join('') +
@@ -1406,6 +1533,14 @@ function init() {
     renderKdcaChart();
     renderKdcaEvents();
   }
+  if (DATA.blend) {
+    renderBlendSummary();
+    renderBlendScorecard();
+    renderBlendLeadChart();
+    renderBlendWeights();
+  } else {
+    document.getElementById('blend-summary').innerHTML = '<p class="note">Blend not computed.</p>';
+  }
   renderInsights();
 }
 
@@ -1430,7 +1565,7 @@ def load_chartjs_inline() -> str:
     return ""
 
 
-def write_dashboard(mw: pd.DataFrame, patterns: dict, forecast_series: dict, insights: list[str], kdca: dict | None = None) -> None:
+def write_dashboard(mw: pd.DataFrame, patterns: dict, forecast_series: dict, insights: list[str], kdca: dict | None = None, blend: dict | None = None) -> None:
     data = {
         "scorecard":      df_to_records(mw),
         "seasonal":       df_to_records(patterns["seasonal"]),
@@ -1464,6 +1599,18 @@ def write_dashboard(mw: pd.DataFrame, patterns: dict, forecast_series: dict, ins
         }
     else:
         data["kdca"] = None
+    if blend is not None:
+        data["blend"] = {
+            "best":        blend["best"],
+            "windowStats": df_to_records(blend["window_stats"].astype({"Window": str})),
+            "leadStats":   df_to_records(blend["lead_stats"]),
+            "weights":     df_to_records(blend["weights"]),
+            "testStart":   blend["test_start"],
+            "testEnd":     blend["test_end"],
+            "nTest":       blend["n_test"],
+        }
+    else:
+        data["blend"] = None
     payload = json.dumps(data, allow_nan=False, default=str)
     html = HTML_TEMPLATE.replace("__DATA_JSON__", payload)
     chartjs = load_chartjs_inline()
@@ -1715,8 +1862,14 @@ def main() -> None:
             ignore_index=True
         ).to_csv(KDCA_CSV_OUT, index=False)
 
-    write_dashboard(mw, patterns, series, insights, kdca)
+    # Blended GFS+ECE+GEFS forecast, walk-forward backtest (imported here: blend_model imports this module)
+    from blend_model import print_blend_summary, run_blend, write_blend_outputs
+    blend = run_blend(df)
+    write_blend_outputs(blend)
+
+    write_dashboard(mw, patterns, series, insights, kdca, blend)
     print_summary(mw, patterns, n_rows, kdca)
+    print_blend_summary(blend)
 
 
 if __name__ == "__main__":
